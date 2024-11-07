@@ -7,7 +7,7 @@ This solution provides automated target group registration for EKS nodes using a
 
 The system runs as a DaemonSet on your EKS cluster, automatically registering each node with the appropriate target groups defined in your Cast.ai node configurations. It continuously monitors the registration status and ensures nodes remain registered even after cluster changes.
 
-![Workflow Diagram](workflow-diagram.png)
+![Workflow Diagram](wrokflowtg.png)
 
 ## Prerequisites
 
