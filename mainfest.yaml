@@ -1,0 +1,169 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: register-script
+  namespace: default
+data:
+  register-targets.sh: |
+    #!/bin/bash
+    set -euo pipefail
+
+    # Enable debug mode if DEBUG environment variable is set
+    if [ "${DEBUG:-}" == "true" ]; then
+      set -x
+    fi
+
+    # Configurable variables
+    CLUSTER_NAME="${CLUSTER_NAME:-eks-061101}"
+    AWS_REGION="${AWS_REGION:-us-east-2}"
+    CLUSTER_API_KEY=YOUR_API_KEY 
+    CLUSTER_ID="YOUR_CLUSTER_ID"
+    SLEEP_INTERVAL="${SLEEP_INTERVAL:-300}"  # Default to 300 seconds (5 minutes)
+
+
+    # Simple print function
+    print() {
+      echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
+    }
+
+    # Fetch the node name where this pod is running
+    # NODE_NAME= $NODE_NAME 
+    print "Node Name: $NODE_NAME"
+
+    # Fetch the value of the label provisioner.cast.ai/node-configuration-name from the node
+    NODE_CONFIG_ID=$(kubectl get node "$NODE_NAME" -o=jsonpath="{.metadata.labels['provisioner\.cast\.ai/node-configuration-id']}")
+    
+    if [ -z "$NODE_CONFIG_ID" ]; then
+      print "Error: Label 'provisioner.cast.ai/node-configuration-id' not found on node $NODE_NAME."
+      exit 1
+    fi
+
+    print "Node Label 'provisioner.cast.ai/node-configuration-id' for node $NODE_NAME: $NODE_CONFIG_ID"
+    
+
+    while true; do
+      # Fetch the instance ID of the current node
+      print "Fetching instance ID..."
+      INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+      if [ -z "$INSTANCE_ID" ]; then
+        print "Error: Unable to retrieve instance ID. Exiting."
+        exit 1
+      fi
+      print "Instance ID: $INSTANCE_ID"
+
+      # Fetch node configuration details from Cast API
+      print "Fetching node configuration details from Cast API for node config ID $NODE_CONFIG_ID..."
+      RESPONSE=$(curl --silent --request GET \
+                       --url "https://api.cast.ai/v1/kubernetes/clusters/$CLUSTER_ID/node-configurations/$NODE_CONFIG_ID" \
+                       --header "X-API-Key: $CLUSTER_API_KEY" \
+                       --header 'accept: application/json')
+
+      # Extract target groups and their ports from the response
+      print "Extracting target group ARNs and ports..."
+      TARGET_GROUP_ARNS=$(echo "$RESPONSE" | jq -r '.eks.targetGroups[] | "\(.arn):\(.port)"')
+
+      if [ -z "$TARGET_GROUP_ARNS" ]; then
+        print "Error: No target groups found in node configuration. Exiting."
+        exit 1
+      fi
+      print "Target Group ARNs and Ports retrieved. $TARGET_GROUP_ARNS"
+
+      # Register the instance with each target group if not already registered
+      for TARGET_GROUP in $TARGET_GROUP_ARNS; do
+        # ARN=$(echo "$TARGET_GROUP" | cut -d':' -f1)
+        # echo $ARN
+        # PORT=$(echo "$TARGET_GROUP" | cut -d':' -f2)
+
+        ARN=$(echo "$TARGET_GROUP" | sed 's/\(.*\):[0-9]*$/\1/')
+
+        # Extract Port (everything after the last colon)
+        PORT=$(echo "$TARGET_GROUP" | awk -F: '{print $NF}')
+
+        print "Checking if instance $INSTANCE_ID is already registered with target group $ARN on port $PORT..."
+
+        # Check current target health for the target group
+        TARGET_HEALTH=$(aws elbv2 describe-target-health --region "$AWS_REGION" --target-group-arn "$ARN" --query "TargetHealthDescriptions[?Target.Id=='$INSTANCE_ID'].TargetHealth.State" --output text)
+
+        if [[ "$TARGET_HEALTH" =~ ^(healthy|initial|unhealthy)$ ]]; then
+          print "Instance $INSTANCE_ID is already registered with target group $ARN. Skipping."
+        else
+          print "Instance $INSTANCE_ID is not registered with target group $ARN. Registering now..."
+          if aws elbv2 register-targets --region "$AWS_REGION" --target-group-arn "$ARN" --targets Id="$INSTANCE_ID"; then
+            print "Successfully registered instance $INSTANCE_ID with target group $ARN."
+          else
+            print "Error: Failed to register instance $INSTANCE_ID with target group $ARN."
+            continue
+          fi
+
+          # Wait for 5 seconds before the next registration
+          print "Waiting for 5 seconds before registering the next target group..."
+          sleep 5
+        fi
+      done
+
+      # Wait before the next loop iteration
+      print "Waiting for $SLEEP_INTERVAL seconds before checking again..."
+      sleep "$SLEEP_INTERVAL"
+    done
+---
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: target-registrar
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: target-registrar
+  template:
+    metadata:
+      labels:
+        app: target-registrar
+    spec:
+      serviceAccountName: target-registrar-sa
+      containers:
+      - name: target-registrar
+        image: heyvaldemar/aws-kubectl  # Use an image with AWS CLI pre-installed
+        command: ["/bin/bash", "/scripts/register-targets.sh"]
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName  # This will give you the node name
+        volumeMounts:
+        - name: script-volume
+          mountPath: /scripts
+          readOnly: true
+      volumes:
+      - name: script-volume
+        configMap:
+          name: register-script
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  # The name of the ClusterRole
+  name: target-registrar-node-access
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: target-registrar-node-access-binding
+subjects:
+  - kind: ServiceAccount
+    name: target-registrar-sa
+    namespace: default  # Adjust the namespace if your service account is in a different namespace
+roleRef:
+  kind: ClusterRole
+  name: target-registrar-node-access
+  apiGroup: rbac.authorization.k8s.io
+
+
+---
